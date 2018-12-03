@@ -29,20 +29,24 @@ class X::SSH::LibSSH::Error is Exception {
 }
 
 class SSH::LibSSH {
-    multi sub error-check($what, Int $result) returns int32 {
-        my int32 $res = $result;
-        if $res == SSH_ERROR {
-            die X::SSH::LibSSH::Error.new(message => "Failed to $what");
-        }
-        $res
-    }
     multi sub error-check(SSHSession $s, Int $result) returns int32 {
         my int32 $res = $result;
+
         if $res == SSH_ERROR {
-            die X::SSH::LibSSH::Error.new(message => ssh_get_error($s));
+            fail X::SSH::LibSSH::Error.new(message => ssh_get_error($s));
         }
         $res
     }
+
+    multi sub error-check($what, Int $result) returns int32 {
+        my int32 $res = $result;
+
+        if $res == SSH_ERROR {
+            fail X::SSH::LibSSH::Error.new(message => "Failed to $what");
+        }
+        $res
+    }
+
 
     # We use libssh exclusively in non-blocking mode. A single event loop
     # thread manages all interactions with libssh (that is, we only ever make
@@ -106,8 +110,7 @@ class SSH::LibSSH {
 
         method remove-session(SSHSession $session --> Nil) {
             self!assert-loop-thread();
-            error-check('remove session from event loop',
-                ssh_event_remove_session($!loop, $session));
+            ssh_event_remove_session($!loop, $session);# XXX it will fail when connection timed out
             %!session-forward-port-map{$session}:delete;
             $!active-sessions--;
         }
@@ -193,7 +196,9 @@ class SSH::LibSSH {
         has Str $!password;
         has Str $.private-key-file;
         has Str $.private-key-file-password;
+        has Str $.known-hosts-location; #  It may include "%d" which will be replaced by the user home directory.
         has Int $.timeout;
+        has Bool $.allow-unknown-host;
         has LogLevel $!log-level;
         has &.on-server-unknown;
         has &.on-server-known-changed;
@@ -203,7 +208,8 @@ class SSH::LibSSH {
         submethod BUILD(Str :$!host!, Int :$!port = 22, Str :$!user = $*USER.Str,
                         Str :$!private-key-file = Str, Str :$!password = Str,
                         Str :$!private-key-file-password = Str,
-                        Int :$!timeout, LogLevel :$!log-level = None,
+                        Str :$!known-hosts-location,
+                        Int :$!timeout = 60, LogLevel :$!log-level = None, Bool :$!allow-unknown-host = False,
                         :&!on-server-unknown = &default-server-unknown,
                         :&!on-server-known-changed = &default-server-known-changed,
                         :&!on-server-found-other = &default-server-found-other) {}
@@ -211,7 +217,7 @@ class SSH::LibSSH {
         sub default-server-unknown($handler) {
             say "This server is unknown. It presented the public key hash:";
             say $handler.hash;
-            given prompt("Do you want to accpet it (yes/once/NO)?") {
+            given prompt("Do you want to accept it (yes/once/NO)?") {
                 when /:i ^ y[es] $/ { $handler.accept-and-save() }
                 when /:i ^ n[o] $/ { $handler.accept-this-time() }
                 default { $handler.decline() }
@@ -233,6 +239,7 @@ class SSH::LibSSH {
         method connect(:$scheduler = $*SCHEDULER --> Promise) {
             my $p = Promise.new;
             my $v = $p.vow;
+            my $start = now;
             given get-event-loop() -> $loop {
                 $loop.run-on-loop: {
                     with $!session-handle = ssh_new() -> $s {
@@ -250,26 +257,42 @@ class SSH::LibSSH {
                         }
                         with $!timeout {
                             error-check($s,
-                                ssh_options_set_int($s, SSH_OPTIONS_TIMEOUT,
-                                    CArray[int32].new($!timeout)));
+                                ssh_options_set_long($s, SSH_OPTIONS_TIMEOUT,
+                                    CArray[long].new($!timeout)));
+                        }
+                        with $!known-hosts-location {
+                            error-check($s,
+                                ssh_options_set_str($s, SSH_OPTIONS_KNOWNHOSTS, $!known-hosts-location));
                         }
 
-                        my $outcome = error-check($s, ssh_connect($s));
+                        my int32 $outcome = error-check($s, ssh_connect($s));
                         $loop.add-session($s);
-                        if $outcome == 0 {
+                        if $outcome == SSH_OK {
                             # Connected "immediately", more on to auth server.
-                            self!connect-auth-server($v, $scheduler);
+                            if $.allow-unknown-host {
+                                if self!store-to-known-host($v) {
+                                    self!connect-auth-user($v, $scheduler);
+                                }
+                            } else {
+                                self!connect-auth-server($v, $scheduler);
+                            }
                         }
                         else {
                             # Will need to poll.
                             $loop.add-poller: -> $remove is rw {
-                                if error-check($s, ssh_connect($s)) == 0 {
+                                my $diff = now - $start; #NOTE custom
+                                if  $diff > $!timeout { # Custom timeout - libssh async is ignoring the timeout
+                                    fail X::SSH::LibSSH::Error.new(message => 'Could not connect - timeouted');
+                                }
+
+                                if error-check($s, ssh_connect($s)) == SSH_OK {
                                     $remove = True;
                                     self!connect-auth-server($v, $scheduler);
                                 }
                                 CATCH {
                                     default {
                                         $remove = True;
+                                        self!teardown-session(); #XXX
                                         $v.break($_);
                                     }
                                 }
@@ -312,6 +335,34 @@ class SSH::LibSSH {
                 CATCH {
                     default {
                         self!teardown-session();
+                        $v.break($_);
+                    }
+                }
+            }
+        }
+
+        method !store-to-known-host($v) {
+            given $!session-handle -> $s {
+                given SSHServerKnown( error-check($s, ssh_session_is_known_server($s) ) ) {
+                    when SSH_SERVER_KNOWN_OK {
+                        return True;
+                    }
+                    when SSH_SERVER_NOT_KNOWN | SSH_SERVER_FILE_NOT_FOUND {
+                        return ssh_session_update_known_hosts($s) == SSH_OK;
+                    }
+                    when SSH_SERVER_KNOWN_CHANGED {
+                        fail X::LibSSH::SSH.new(message => 'The host key for the server has changed, perhaps due to an attack.');
+                    }
+                    when SSH_SERVER_FOUND_OTHER {
+                        fail X::LibSSH::SSH.new(message => 'Found other ssh key. Disconnect');
+                    }
+                    default {
+                        fail X::LibSSH::SSH.new(message => 'Unknown error when saving to known_hosts file');
+                    }
+                }
+                CATCH {
+                    default {
+                        self!teardown-session(); # Close connection on error here
                         $v.break($_);
                     }
                 }
@@ -368,6 +419,7 @@ class SSH::LibSSH {
         # Performs the user authorization step of connecting.
         method !connect-auth-user($v, $scheduler) {
             my $key;
+            my $start = now;
             with $!private-key-file {
                 my $key-out = CArray[SSHKey].new;
                 $key-out[0] = SSHKey;
@@ -388,6 +440,12 @@ class SSH::LibSSH {
                 else {
                     # Poll until result available.
                     get-event-loop().add-poller: -> $remove is rw {
+                        if $.timeout {
+                            my $diff = now - $start;
+                            if $diff > $.timeout {
+                                fail X::LibSSH::SSH.new(message => 'Connected, but timeouted authorize');
+                            }
+                        }
                         my $auth-outcome = SSHAuth(error-check($s, auth-function()));
                         if $auth-outcome != SSH_AUTH_AGAIN {
                             $remove = True;
@@ -465,7 +523,7 @@ class SSH::LibSSH {
             }
         }
 
-        method interactive(Str $terminal!, Int $cols!, Int $rows! --> Promise) {
+        method interactive(Str $terminal!, Int $cols!, Int $rows!, %ENV? --> Promise) {
             my $p = Promise.new;
             my $v = $p.vow;
             given get-event-loop() -> $loop {
@@ -475,6 +533,7 @@ class SSH::LibSSH {
                         my int32 $open  = SSH_AGAIN;
                         my int32 $pty   = SSH_AGAIN;
                         my int32 $shell = SSH_AGAIN;
+                        my int32 $env   = %ENV.elems ?? SSH_AGAIN !! SSH_OK;
 
                         unless $open == SSH_OK && $pty == SSH_OK && $shell == SSH_OK {
                             $loop.add-poller: -> $remove is rw {
@@ -488,11 +547,19 @@ class SSH::LibSSH {
                                         $pty = error-check('request a pty',
                                             ssh_channel_request_pty_size($channel, $terminal, $cols, $rows));
                                     }
-                                    if $shell == SSH_AGAIN && $pty == SSH_OK {
+                                    if %ENV.elems > 0 &&  $env == SSH_AGAIN && $pty == SSH_OK {
+                                        for %ENV.kv -> $k,$v {
+                                            $env = error-check($!session-handle, ssh_channel_request_env($channel, $k, $v));
+                                            last if $env == SSH_AGAIN;
+                                        }
+                                    }
+                                    if $shell == SSH_AGAIN && $pty == SSH_OK && $env == SSH_OK {
                                         $shell = error-check('request shell',
                                             ssh_channel_request_shell($channel));
                                     }
-                                    if $pty == SSH_OK && $shell == SSH_OK {
+
+
+                                    if $pty == SSH_OK && $shell == SSH_OK && $env == SSH_OK {
                                         if ssh_channel_is_open($channel) == 1 {
                                             $remove = True;
                                             $v.keep(Channel.from-raw-handle($channel, self));
@@ -528,6 +595,7 @@ class SSH::LibSSH {
             my $p = Promise.new;
             my $v = $p.vow;
             given get-event-loop() -> $loop {
+                $!session-handle.Bool; # TODO golf down problem with "Cannot lookup attributes"
                 $loop.run-on-loop: {
                     my $channel = ssh_channel_new($!session-handle);
                     with $channel {
@@ -766,8 +834,8 @@ class SSH::LibSSH {
 
                     sub check-status-code($data) {
                         unless $data.elems == 1 && $data[0] == 0 {
-                            die "Unexpected SCP status $data[0]: " ~
-                                $data.subbuf(1).decode('latin-1');
+                            fail X::SSH::LibSSH::Error.new( message => "Unexpected SCP status $data[0]: " ~
+                                                           $data.subbuf(1).decode('latin-1') );
                         }
                     }
 
@@ -858,7 +926,7 @@ class SSH::LibSSH {
                         !! StreamingDecoder.new(Rakudo::Internals.NORMALIZE_ENCODING(
                                 $enc // 'utf-8'));
                     $loop.add-poller: -> $remove is rw {
-                        if ssh_channel_is_eof($!channel-handle) {
+                        if ssh_channel_is_open($!channel-handle) == 0 || ssh_channel_is_eof($!channel-handle) != 0 {
                             $remove = True;
                             unless $bin {
                                 $s.emit($decoder.consume-all-chars());
@@ -912,6 +980,18 @@ class SSH::LibSSH {
                     my int $left-to-send = $data.elems;
                     $progress.set-target($left-to-send);
                     sub maybe-send-something-now() {
+
+                        CATCH {
+                            default {
+                                $v.break($_);
+                                return True;
+                            }
+                        }
+
+                        if ssh_channel_is_open($!channel-handle) == 0 || ssh_channel_is_eof($!channel-handle) != 0 {
+                            fail X::SSH::LibSSH::Error.new( message => "Channel is closed for writing" );
+                        }
+
                         my uint $ws = ssh_channel_window_size($!channel-handle);
                         my $send = [min] $ws, 0xFFFFF, $left-to-send;
                         if $send {
@@ -992,11 +1072,30 @@ class SSH::LibSSH {
             $p
         }
 
+        method send_signal(Str $sig!){
+            my $p = Promise.new;
+            my $v = $p.vow;
+            get-event-loop().run-on-loop: {
+
+                with $!channel-handle {
+                    error-check($!session.session-handle, ssh_channel_request_send_signal($_, $sig));
+                }
+                $v.keep(True);
+                CATCH {
+                    default {
+                        $v.break($_);
+                    }
+                }
+            }
+            $p;
+        }
+
         method close() {
             my $p = Promise.new;
             my $v = $p.vow;
             get-event-loop().run-on-loop: {
                 with $!channel-handle {
+
                     error-check('close a channel', ssh_channel_close($_));
                     ssh_channel_free($_);
                 }
