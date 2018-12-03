@@ -40,7 +40,7 @@ sub load-windows-dependencies(--> Nil) {
 constant SSH_OK     is export = 0;     # /* No error */
 constant SSH_ERROR  is export = -1;    # /* Error of some kind */
 constant SSH_AGAIN  is export = -2;    # /* The nonblocking call must be repeated */
-constant SSH_EOF    is export = -127;  # /* We have already a eof */
+constant SSH_EOF 	is export = -127;  # /* We have already a eof */
 
 my class SSHSession is repr('CPointer') is export {}
 my enum SSHSessionOptions is export <
@@ -84,9 +84,21 @@ my enum SSHServerKnown is export (
     :SSH_SERVER_FOUND_OTHER(3),
     :SSH_SERVER_FILE_NOT_FOUND(4)
 );
+
+my enum SSHKnownHosts is export (
+    :SSH_KNOWN_HOSTS_ERROR(-2),
+    :SSH_KNOWN_HOSTS_NOT_FOUND(-1),
+    :SSH_KNOWN_HOSTS_UNKNOWN(0),
+    :SSH_KNOWN_HOSTS_OK(1),
+    :SSH_KNOWN_HOSTS_CHANGED(2),
+    :SSH_KNOWN_HOSTS_OTHER(3),
+);
+
 sub ssh_new() returns SSHSession is native(&libssh) is export {*}
 sub ssh_free(SSHSession) is native(&libssh) is export {*}
 sub ssh_set_blocking(SSHSession, int32) is native(&libssh) is export {*}
+sub ssh_options_set_long(SSHSession, int32, CArray[long]) returns int32
+    is symbol('ssh_options_set') is native(&libssh) is export {*}
 sub ssh_options_set_int(SSHSession, int32, CArray[int32]) returns int32
     is symbol('ssh_options_set') is native(&libssh) is export {*}
 sub ssh_options_set_str(SSHSession, int32, Str) returns int32
@@ -139,6 +151,9 @@ sub ssh_channel_request_pty(SSHChannel) returns int32 is native(&libssh) is expo
 sub ssh_channel_request_pty_size(SSHChannel, Str, int32, int32) returns int32 is native(&libssh) is export {*}
 sub ssh_channel_change_pty_size(SSHChannel, int32, int32) returns int32 is native(&libssh) is export {*}
 sub ssh_channel_request_shell(SSHChannel) returns int32 is native(&libssh) is export {*}
+sub ssh_channel_request_env(SSHChannel, Str, Str) returns int32 is native(&libssh) is export {*}
+sub ssh_channel_request_send_signal(SSHChannel, Str) returns int32 is native(&libssh) is export {*}
+sub ssh_channel_request_send_exit_signal(SSHChannel, Str, int32, Str, Str) returns int32 is native(&libssh) is export {*}
 sub ssh_channel_read_nonblocking(SSHChannel, Buf, uint32, int32) returns int32
     is native(&libssh) is export {*}
 sub ssh_channel_is_eof(SSHChannel) returns int32 is native(&libssh) is export {*}
@@ -153,5 +168,7 @@ sub ssh_channel_listen_forward(SSHSession, Str, int32, CArray[int32]) returns in
 sub ssh_channel_accept_forward(SSHSession, int32, CArray[int32]) returns SSHChannel
     is native(&libssh) is export {*}
 
-sub ssh_get_error(SSHSession) returns Str is symbol('ssh_get_error')
-    is native(&libssh) is export {*}
+sub ssh_get_error(SSHSession) returns Str is native(&libssh) is export {*}
+
+sub ssh_session_is_known_server(SSHSession) returns int32 is native(&libssh) is export {*}
+sub ssh_session_update_known_hosts(SSHSession) returns int32 is native(&libssh) is export {*} # Add the current connected server to the known_hosts file
