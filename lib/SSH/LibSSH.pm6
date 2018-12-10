@@ -199,6 +199,7 @@ class SSH::LibSSH {
         has Str $.known-hosts-location; #  It may include "%d" which will be replaced by the user home directory.
         has Int $.timeout;
         has Bool $.allow-unknown-host;
+        has UInt $.compression-lvl where 0 <= * <= 9 = 0;
         has LogLevel $!log-level;
         has &.on-server-unknown;
         has &.on-server-known-changed;
@@ -210,6 +211,7 @@ class SSH::LibSSH {
                         Str :$!private-key-file-password = Str,
                         Str :$!known-hosts-location,
                         Int :$!timeout = 60, LogLevel :$!log-level = None, Bool :$!allow-unknown-host = False,
+                        UInt :$!compression-lvl where 0 <= * <= 9 = 0,
                         :&!on-server-unknown = &default-server-unknown,
                         :&!on-server-known-changed = &default-server-known-changed,
                         :&!on-server-found-other = &default-server-found-other) {}
@@ -263,6 +265,13 @@ class SSH::LibSSH {
                         with $!known-hosts-location {
                             error-check($s,
                                 ssh_options_set_str($s, SSH_OPTIONS_KNOWNHOSTS, $!known-hosts-location));
+                        }
+
+                        if $!compression-lvl > 0 {
+                            error-check($s,
+                                ssh_options_set_str($s, SSH_OPTIONS_COMPRESSION, "yes")); # ("zlib","zlib@openssh.com","none")
+                            error-check($s,
+                                ssh_options_set_int($s, SSH_OPTIONS_COMPRESSION_LEVEL, CArray[int32].new($!compression-lvl)));
                         }
 
                         my int32 $outcome = error-check($s, ssh_connect($s));
